@@ -1,0 +1,108 @@
+#!/bin/bash
+# desc: 防火墙相关操作
+# author: echoxu
+# 功能:
+#       1. add: 防火墙添加规则
+#       2. remove: 防火墙删除规则
+
+
+. lib/common
+
+
+# 检查防火墙是否安装与启用
+check_firewall_status(){
+    # 可以用 sudo 替代这里的检查
+    # is_root_res=$(is_root_user)
+    # if [ $? -eq 203 ];then
+    #     return 203
+    # fi
+
+    is_installed=`sudo /usr/bin/firewall-cmd -V`
+    if [ $? != 0 ];then 
+        return 144
+    fi
+
+    is_running=`sudo /usr/bin/firewall-cmd --state`
+    if [ $? != 0 ];then   
+        return 205
+    fi
+}
+
+
+# 重启防火墙
+firewalld_reload(){
+   sudo  /usr/bin/firewall-cmd --reload > /dev/null 2>&1
+
+   echo -e "${Succeed}: 重启了 Firewalld"
+}
+
+
+# 验证 ip 是否在防火墙规则中存在
+isexist_in_firewall_rules(){
+    to_check=$1
+
+    flag=144
+
+    # 这里不用验证防火墙状态
+
+    ip_from_firewall_rules=`sudo /usr/bin/firewall-cmd --zone=public --list-rich-rules |awk -F ' ' '{print $4}' |grep -E -o "(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)"`
+
+    for ip in $ip_from_firewall_rules
+    do
+    if [ "$ip" = "$to_check" ];then
+        flag=200
+    fi
+
+    done
+
+    return $flag
+}
+
+
+# 防火墙操作：获取被封禁的 ip
+firewall_op_with_get(){
+    ip_from_firewall_rules=`sudo /usr/bin/firewall-cmd --zone=public --list-rich-rules |awk -F ' ' '{print $4}' |grep -E -o "(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)"`
+
+    output_file=/tmp/firewall_rules_ip_$(date +'%F-%T')
+    for ip in $ip_from_firewall_rules
+    do
+        echo $ip >> $output_file
+    done
+
+    echo $output_file
+}
+
+
+# 防火墙操作: 封禁 ip
+# fix: 如果直接调用无法验证输入的是否是 ip
+firewall_op_with_add(){
+    to_add_ip=$1
+
+    is_ip_result=$(isexist_in_firewall_rules  $to_add_ip)
+    code=$?
+    if [ $code -eq 200 ];then
+        err_code $code "IP: $to_add_ip 已在防火墙规则列表中存在,请勿重复添加..."
+        return 200
+    fi
+
+    sudo /usr/bin/firewall-cmd --permanent --add-rich-rule="rule family=ipv4 source address=$to_add_ip drop" > /dev/null 2>&1
+
+    echo -e "${Succeed}: IP: $to_add_ip 已添加进防火墙列表中."
+}
+
+
+# 防火墙操作: 解禁 ip
+firewall_op_with_remove(){
+    to_remove_ip=$1
+
+    is_ip_result=$(isexist_in_firewall_rules  $to_remove_ip)
+    code=$?
+    if [ $code -eq 144 ];then
+        err_code $code "IP: $to_remove_ip 在防火墙规则列表中没找到"
+        return 144
+    fi
+
+    sudo /usr/bin/firewall-cmd --permanent --remove-rich-rule="rule family=ipv4 source address=$to_remove_ip drop" > /dev/null 2>&1
+
+    echo -e "${Succeed}: IP: $to_remove_ip 已从防火墙列表中删除."
+}

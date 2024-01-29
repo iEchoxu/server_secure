@@ -1,0 +1,5 @@
+0 0 * * * /usr/sbin/logrotate -f /etc/logrotate.daily.0/nginx >/dev/null 2>&1
+
+*/10 * * * * sh /root/black_list.sh add > /dev/null 2>&1 &
+
+0 0 * * * /usr/bin/echo 0 > /tmp/nginxlog_seek && rm -rf /tmp/nginxlog_since* && rm -rf /tmp/securelog_since*

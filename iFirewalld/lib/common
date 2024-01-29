@@ -1,0 +1,315 @@
+#!/bin/bash
+# desc: 公共函数
+# author: echoxu
+# 功能: 可供其它脚本调用的公共函数
+
+# 打印函数
+Green_font_prefix="\033[32m" && Red_font_prefix="\033[31m" && Green_background_prefix="\033[42;37m" && Red_background_prefix="\033[41;37m" && Font_color_suffix="\033[0m"
+Info="${Green_font_prefix}[信息]${Font_color_suffix}"
+Error="${Red_font_prefix}[错误]${Font_color_suffix}"
+Tip="${Green_font_prefix}[注意]${Font_color_suffix}"
+Succeed="${Green_font_prefix}[成功]${Font_color_suffix}"
+Failed="${Red_font_prefix}[失败]${Font_color_suffix}"
+
+# 自定义错误代码表
+err_code(){
+    return_code=$1
+    msg=$2
+
+    case "$return_code" in
+    100)
+        # echo -e "${Error}: $section_value 是一个目录路径，请输入正确的文件路径..."
+        echo -e "${Error}: $return_code: $msg"
+        ;;
+    101)
+        # echo -e "${Error}: 抱歉，你无法对 $section_value 进行读写操作..."
+        echo -e "${Error}: $return_code: $msg"
+        ;;
+    102)
+        # echo -e "${Error}: 你输入的: $section_value 不是一个数字..."
+        echo -e "${Error}: $return_code: $msg"
+        ;;
+    104)
+        # echo -e "${Error}: $section_value 文件不存在，请先创建它..."
+        echo -e "${Error}: $return_code: $msg"
+        ;;
+    105)
+        # echo -e "${Error}: $section_value 不符合 ip 格式，请确认后再操作..."
+        echo -e "${Error}: $return_code: $msg"
+        ;;
+    106)
+        # echo -e "${Error}: 你输入的: $section_value 不在当前设定的区间范围内,请输入 1 或者 2..."
+        echo -e "${Error}: $return_code: $msg"
+        ;;
+    144)
+        # echo -e "${Error}: 要查找的记录: $section_value 不存在..."
+        echo -e "${Error}: $return_code: $msg"
+        ;;
+    200)
+        # echo -e "${Error}: 要查找的记录：$section_value 已存在，请勿重复添加..."
+        echo -e "${Error}: $return_code: $msg"
+        ;;
+    202)
+        # echo -e "${Error}: 用户 root 权限，可以执行该操作..."
+        echo -e "${Error}: $return_code: $msg"
+        ;;
+    203)
+        # echo -e "${Error}: 该操作需要用户拥有 root 权限..."
+        echo -e "${Error}: $return_code: $msg"
+        ;;
+    204)
+        # echo -e "${Error}: $section_value 参数错误：要查找的参数名在配置文件中没有找到..."
+        echo -e "${Error}: $return_code: $msg"
+        ;;
+    205)
+        # echo -e "${Error}: 程序未运行，请先启动它..."
+        echo -e "${Error}: $return_code: $msg"
+        ;;
+    206)
+        # echo -e "${Error}: 程序版本过低..."
+        echo -e "${Error}: $return_code: $msg"
+        ;;
+    207)
+        # echo -e "${Error}: 数据发生更改..."
+        echo -e "${Error}: $return_code: $msg"
+        ;;
+    208)
+        # echo -e "${Error}: 数据未被更改..."
+        echo -e "${Error}: $return_code: $msg"
+        ;;
+    *)
+    ;;
+    esac
+}
+
+
+# 打印获取配置文件中 section value 时返回的错误信息
+print_return_code_message_of_get_section_path(){
+    return_code=$1
+    if [ $return_code != 0 ];then
+        case "$return_code" in
+        104)
+            err_code $return_code "没有找到配置文件, 请先用 config.sh -c 来创建它..."
+            exit 1
+            ;;
+        204)
+            err_code $return_code "参数错误：要查找的参数名在配置文件中没有找到..."
+            exit 1
+            ;;
+        esac
+    fi
+}
+
+
+# 打印验证输入是否是合法路径时返回的错误信息
+print_message_of_vaild_is_path_from_input(){
+    return_code=$1
+    filepath=$2
+
+    case "$return_code" in
+    100)
+        err_code $return_code "$filepath 是一个目录路径，请输入正确的文件路径..."
+        exit 1
+        ;;
+    104)
+        err_code $return_code "$filepath 文件不存在，请先创建它..."
+        exit 1
+        ;;
+    101)
+        err_code $return_code "抱歉，你无法对 $filepath 进行读写操作..."
+        exit 1
+        ;;
+    esac
+}
+
+
+# 打印验证防火墙状态时返回的错误信息
+print_message_of_check_firewall_status(){
+    return_code=$1
+
+    if [ $return_code != 0 ];then
+        case "$return_code" in
+        144)
+            err_code $return_code "未找到 firewalld 程序，请先安装它..."
+            exit 1
+            ;;
+        203)
+            err_code $return_code "执行防火墙操作需要用户拥有 root 权限..."
+            exit 1
+            ;;
+        205)
+            err_code $return_code "firewalld 未运行，请先启动它..."
+            exit 1
+            ;;
+        esac
+    fi
+}
+
+
+# 打印验证 ip 是否存在时返回的错误信息
+print_message_of_isipexist_in_file(){
+    return_code=$1
+    ip=$2
+
+    if [ $return_code != 0 ];then
+        case "$return_code" in
+        144)
+            err_code $return_code "IP: $ip 没有找到该记录..."
+            return 144
+            ;;
+        200)
+            err_code $return_code "IP: $ip 该记录已存在，请勿重复添加..."
+            return 144
+            ;;
+        esac
+    fi
+}
+
+
+# 配置文件公共函数: 记录配置文件路径，不包含配置参数
+config_path_temp=${HOME}/.config_path_temp
+
+
+# 配置文件公共函数: 验证输入的文件名格式是否符合规范
+vaild_is_path_from_input(){
+    to_valid=$1
+
+    if [ -d $to_valid ];then
+        return 100
+    elif [ ! -f $to_valid ];then
+        return 104
+    elif [ ! -r $to_valid ];then
+        return 101
+    else
+        echo $to_valid
+    fi 
+}
+
+
+# 配置文件公共函数: 验证输入的值是不是数字
+vaild_is_number_from_input(){
+    to_valid=$1
+
+    if [ -n "$(echo $to_valid| sed -n "/^[0-9]\+$/p")" ];then
+        echo $to_valid
+    else
+        return 102
+    fi
+}
+
+
+# 配置文件公共函数: 相对路径转换为绝对路径
+get_real_path(){
+    to_translate=$1
+
+    to_translate_realdir=$(cd $(dirname $to_translate) > /dev/null 2>&1;pwd)
+    to_translate_filename=`basename $to_translate`
+
+    to_translate=${to_translate_realdir}/${to_translate_filename}
+    
+    echo $to_translate
+}
+
+
+# 配置文件公共函数:获取配置文件路径
+get_config_path(){
+    # 如果 ${HOME}/.config_path_temp 不存在返回 104
+    if [ ! -f $config_path_temp ];then
+        return 104
+    fi
+
+    config_path=`cat $config_path_temp|grep "FilePath"|cut -d '=' -f 2`
+
+    echo $config_path
+}
+
+
+# 配置文件公共函数: 读取配置文件中每个 section name 对应的值
+get_section_value_from_config_path(){
+    section_name=$1
+
+    # 如果 ${HOME}/.config_path_temp 不存在返回 104（被误删除）
+    config_file_path=$(get_config_path)
+    code=$?
+    if [ $code != 0 ];then
+        return 104
+    fi
+
+    # 如果主配置文件不存在返回 104 （被误删除）
+    if [ ! -f $config_file_path ];then
+        return 104
+    fi
+
+    # 防止代码中出现传参错误
+    count=`cat $config_file_path|grep $section_name|wc -l`
+    if [ $count -eq 0 ];then
+        return 204
+    fi
+
+    section_value=`cat $config_file_path|grep $section_name|cut -d '=' -f 2`
+
+    echo $section_value
+}
+
+
+# 校验数据是否存在
+isipexist_in_file(){
+    flag=200   # 200 表示记录已存在
+
+    file_path=$1
+    ip=$2
+
+    ip_is_exist=`cat $file_path |grep -Fx $ip|wc -l`    # -Fx 完全匹配
+    
+    if [ $ip_is_exist -eq 0 ];then
+        # 144 表示该记录没有被找到
+        flag=144
+    fi
+
+    return $flag
+}
+
+
+# 验证是否是 ip
+isip_from_input(){
+    input_value=$1
+    
+    # re='^((25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])$'
+
+    if [[ ! $input_value =~ ^(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?) ]];then
+        return 105
+    fi
+
+    echo $input_value
+}
+
+
+# 检查是否是 root 权限用户，因为防火墙操作需要用户拥有 root 权限
+is_root_user(){
+    user_id=`id -u`
+
+    is_root=202  # 表示是 root 用户
+
+    if [ ! $user_id = 0 ];then
+        is_root=203  # 表示不是 root 用户
+    fi
+
+    return $is_root
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

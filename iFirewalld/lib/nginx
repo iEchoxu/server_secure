@@ -1,0 +1,296 @@
+#!/bin/bash
+# desc: 使用 nginx host deny 文件实现封禁 ip,不影响 ssh 登录，但需重启 nginx
+# date: 2023-12-04 15:00
+# author: echoxu
+# 功能: 生成 nginx host deny 文件并封禁 ip
+
+
+. lib/common
+
+
+# 获取 nginx 程序路径
+get_nginx_path(){
+    nginx_bin_path=`ps aux|grep nginx |grep "master process"|awk -F ' ' '{print $14}'`
+
+    echo $nginx_bin_path
+}
+
+
+# 检查 nginx 是否安装以及状态
+# 使用这种方案需要 nginx 安装了 xx 模块，即必须要求 nginx 版本高于 1.18
+valid_nginx_status(){
+    isnginx_runing=`ps aux|grep nginx|grep -v grep|wc -l`
+    if [ "$isnginx_runing" -lt 2 ];then   
+        return 205
+    fi
+
+    nginx_version=''
+
+    nginx_bin_path=$(get_nginx_path)
+
+    nginx_version_info=`$nginx_bin_path -v 2>&1`
+    if [ ! -z "$nginx_version_info"  ];then
+        nginx_version_of_number="${nginx_version_info#*/}"
+        nginx_version=$nginx_version_of_number
+    fi
+
+    get_second_number=`echo $nginx_version |awk -F '.' '{print $2}'`
+    if [ $get_second_number -lt 18 ];then
+        return 206
+    fi
+}
+
+
+# 验证数据是否存在
+isipexist_in_nginx_deny_file(){
+    flag=200   # 200 表示记录已存在
+
+    file_path=$1
+    ip=$2
+    
+    ip_is_exist=`cat $file_path |grep -Fx "$ip"|wc -l`    # -Fx 完全匹配
+    
+    if [ $ip_is_exist -eq 0 ];then
+        # 144 表示该记录没有被找到
+        flag=144
+    fi
+
+    return $flag
+}
+
+
+# 获取 nginx 配置文件路径
+get_nginx_conf_path(){
+    valid_nginx_status
+    code=$?
+    if [ $code != 0 ];then
+        case "$code" in
+        205)
+            err_code 205 "Nginx 未运行，请先启动它..."
+            exit 1
+            ;;
+        206)
+            err_code 206 "Nginx 版本过低，请升级至 nginx 1.18.0 以上版本..."
+            exit 1
+            ;;
+        esac
+    fi
+
+
+    nginx=`$nginx_bin_path -t 2>&1 | grep configuration`
+    if [ ! -z "$nginx"  ];then
+        nginxtmp="${nginx#*file}"
+        nginxf="${nginxtmp%test*}"
+        nginx_conf="${nginxf#*file}"
+        echo $nginx_conf
+    fi
+    
+}
+
+
+get_nginx_host_deny_dir(){
+    nginx_conf=$(get_nginx_conf_path)
+
+    if [ ! -f $nginx_conf ];then
+        err_code 104 "Nginx 配置文件: $nginx_conf 不存在..."
+        exit 1
+    fi
+
+    nginx_conf_dir=`dirname $nginx_conf`
+
+    nginx_conf_site_conf_dir=$nginx_conf_dir/conf.d
+
+    if [ ! -d "$nginx_conf_site_conf_dir" ];then
+        sudo mkdir -p $nginx_conf_site_conf_dir
+    fi
+
+    echo $nginx_conf_site_conf_dir
+}
+
+
+# 获取 nginx host deny file 路径
+get_nginx_host_deny_path(){
+    host_deny_dir=$(get_nginx_host_deny_dir)
+
+    host_deny_file_path=''
+
+    if [ -f $host_deny_dir/block_ip.conf ];then
+        host_deny_file_path=$host_deny_dir/block_ip.conf
+    else
+        set_nginx_host_deny_path $host_deny_dir/block_ip.conf
+        host_deny_file_path=$host_deny_dir/block_ip.conf
+    fi
+
+    echo $host_deny_file_path
+}
+
+
+# 设置 nginx host deny file 文件路径
+set_nginx_host_deny_path(){
+    deny_file_input=$1
+
+    nginx_conf=$(get_nginx_conf_path)
+
+    nginx_conf_site_conf_dir=$(get_nginx_host_deny_dir)
+
+    sudo touch $deny_file_input
+    sudo chmod 666 $deny_file_input
+
+    is_add_site_conf=`cat $nginx_conf|grep "include ${nginx_conf_site_conf_dir}" |wc -l`
+    if [ $is_add_site_conf -eq 0 ];then
+        # 往 nginx.conf 的倒数第二行插入数据
+        sed -i '$i     include '"${nginx_conf_site_conf_dir}"'/*.conf;' $nginx_conf;
+    fi
+}
+
+
+# 往 nginx host deny file 中添加数据
+nginx_record_add(){
+    to_add=$1
+    format_ip=`echo deny $to_add\;`
+
+    nginx_host_deny_file=$(get_nginx_host_deny_path)
+
+    # 必须这样写，不然会导致 add_ip_to_blacklist_with_logs 中写入日志的 ip 格式错误
+    isin_res=$(isipexist_in_nginx_deny_file $nginx_host_deny_file "$format_ip")
+    code=$?
+    if [ $code -eq 200 ];then
+        err_code $code "IP: $to_add 在 Nginx host deny 中已存在，请勿重复添加..."
+        return 200
+    fi
+
+    echo "deny $to_add;" >> $nginx_host_deny_file
+
+    echo -e "${Succeed}: IP: $to_add 已添加进 Nginx host deny 中."
+
+    md5sum $nginx_host_deny_file |awk '{print $1}' > /tmp/.nginx_deny_md5
+
+    rm -rf /tmp/nginx_deny_file_back
+    cp $nginx_host_deny_file /tmp/nginx_deny_file_back
+}
+
+
+# 从 host deny 中删除记录
+nginx_record_remove(){
+    to_remove=$1
+    format_ip=`echo deny $to_remove\;`
+
+    nginx_host_deny_file=$(get_nginx_host_deny_path)
+
+    isin_res=$(isipexist_in_nginx_deny_file $nginx_host_deny_file "$format_ip")
+    code=$?
+    if [ $code -eq 144 ];then
+        err_code $code "IP: $to_remove 在 Nginx host deny 中没有找到..."
+        return 144
+    fi
+
+    sudo sed -i '/^'"${format_ip}"'$/d' $nginx_host_deny_file
+
+    echo -e "${Succeed}: IP: $to_remove 已从 Nginx host deny 中删除."
+
+    sudo md5sum $nginx_host_deny_file |awk '{print $1}' > /tmp/.nginx_deny_md5
+
+    rm -rf /tmp/nginx_deny_file_back
+    cp $nginx_host_deny_file /tmp/nginx_deny_file_back
+}
+
+
+# 打印 nginx host deny file 数据
+list(){
+    nginx_host_deny_file=$(get_nginx_host_deny_path)
+
+    for ip in `cat $nginx_host_deny_file`
+    do
+        echo $ip
+    done
+}
+
+
+# 当手动修改了 nginx host deny file 时要重启 nginx
+check_nginx_deny_file(){
+    nginx_host_deny_file=$(get_nginx_host_deny_path)
+
+    current_md5=`md5sum $nginx_host_deny_file |awk '{print $1}'`
+    last_record_md5=`cat /tmp/.nginx_deny_md5`
+
+    if [ "$current_md5" = "$last_record_md5" ];then
+        echo -e "${Info}: Nginx Host Deny File 数据未发生更改。"
+    else
+        nginx_data_proofreading
+        md5sum $nginx_host_deny_file |awk '{print $1}' > /tmp/.nginx_deny_md5
+
+        echo -e "${Succeed}: 完成数据校对。"
+    fi
+}
+
+
+nginx_data_proofreading(){
+    nginx_host_deny_file=$(get_nginx_host_deny_path)
+
+    log_path=$(get_section_value_from_config_path server_secure_log_path)
+    code=$?
+    print_return_code_message_of_get_section_path $code
+    if [ ! -f $log_path ];then
+        err_code 104 "操作日志记录文件: $log_path 不存在..."
+        exit 1
+    fi
+
+    if [ ! -f "/tmp/nginx_deny_file_back" ];then
+        cp $nginx_host_deny_file /tmp/nginx_deny_file_back
+    fi
+
+    current_nginx_deny_count=`cat $nginx_host_deny_file|wc -l`
+    last_nginx_deny_count=`cat /tmp/nginx_deny_file_back|wc -l`
+
+    cat $nginx_host_deny_file /tmp/nginx_deny_file_back |sort|uniq -d > /tmp/nginx_last_common.txt
+
+    # 手动增加数据
+    if [ "$current_nginx_deny_count" -gt "$last_nginx_deny_count" ];then
+        add_count=`expr $current_nginx_deny_count - $last_nginx_deny_count`
+        echo -e "${Info}: nginx host deny file 中新增了 $add_count 条数据，等待重启 Nginx..." && echo
+
+        cat $nginx_host_deny_file /tmp/nginx_last_common.txt |sort|uniq -u > /tmp/nginx_add.txt  # 获取 nginx 新增的内容
+        while read line || [ -n "$line" ]
+        do
+            ip=`echo $line |awk -F ' '  '{print $2}'|awk -F ';' '{print $1}'`
+            echo "$(date +'%F-%T') 已封禁入侵ip(nvalid+): $ip" >> $log_path
+        done < "/tmp/nginx_add.txt"
+
+        reload_nginx
+        rm -rf /tmp/nginx_last_common.txt /tmp/nginx_add.txt
+
+        rm -rf /tmp/nginx_deny_file_back
+        cp $nginx_host_deny_file /tmp/nginx_deny_file_back
+        sleep 1
+        return 0
+    fi
+
+    # 手动删减数据
+    if [ "$current_nginx_deny_count" -lt "$last_nginx_deny_count" ];then
+        remove_count=`expr $last_nginx_deny_count - $current_nginx_deny_count`
+        echo -e "${Info}: nginx host deny file 中减少了 $remove_count 条数据，等待重启 Nginx..." && echo
+        cat /tmp/nginx_deny_file_back /tmp/nginx_last_common.txt |sort|uniq -u > /tmp/nginx_remove.txt  # nginx 删减的数据
+        while read line || [ -n "$line" ]
+        do
+            ip=`echo $line |awk -F ' '  '{print $2}'|awk -F ';' '{print $1}'`
+            echo "$(date +'%F-%T') 已解封ip(nvalid-): $ip" >> $log_path
+        done < "/tmp/nginx_remove.txt"
+        
+        reload_nginx
+        rm -rf /tmp/nginx_last_common.txt /tmp/nginx_remove.txt
+
+        rm -rf /tmp/nginx_deny_file_back
+        cp $nginx_host_deny_file /tmp/nginx_deny_file_back
+        sleep 1
+        return 0
+    fi
+}
+
+
+# 重启 Nginx
+reload_nginx(){
+    ngx_bin=$(get_nginx_path)
+    sudo $ngx_bin -s reload
+
+    echo -e "${Succeed}: 重启了 Nginx"
+}

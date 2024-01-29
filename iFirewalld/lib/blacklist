@@ -1,0 +1,722 @@
+#!/bin/bash
+# desc: ip 黑名单
+# author: echoxu
+# 功能:
+#       1. 命令行中添加要封禁的 ip,支持批量操作
+#       2: 可解禁指定文件里的 ip，支持批量操作
+#       3：自动封禁 nginx log、secure log、lastb 次数超过指定数量的 ip
+#       4: 通过日志文件偏移量读取日志文件，避免读取到重复数据
+#       5：数据校验: 防火墙和黑名单数据一致性校验，nginx host deny file 数据一致性校验
+#       6：随意切换封锁 ip 的方案（firewalld/nginx）并迁移前方案的数据
+
+. lib/common
+. lib/firewall
+. lib/nginx
+
+ip_arr=()
+
+
+# 检查 blacklist 文件状态：当 blacklist 文件被手动修改了就触发防火墙操作
+check_blacklist_file_status(){
+    blacklist_path=$(get_section_value_from_config_path blacklist_path)
+    code=$?
+    print_return_code_message_of_get_section_path $code
+
+    current_md5=`md5sum $blacklist_path |awk '{print $1}'`
+    last_record_md5=`cat /tmp/.blacklist_md5`
+
+    if [ "$current_md5" = "$last_record_md5" ];then
+        echo -e "${Info}: 黑名单数据未发生更改。"
+    else
+        data_proofreading
+        md5sum $blacklist_path |awk '{print $1}' > /tmp/.blacklist_md5
+
+        echo -e "${Succeed}: 完成数据校对。"
+    fi   
+}
+
+# 检查 blacklist 以及 nginx host deny file 文件状态
+check_block_type_file_status(){
+    block_ip_type=$(get_section_value_from_config_path block_ip_type)
+    code=$?
+    print_return_code_message_of_get_section_path $code
+
+    if [ "$block_ip_type" = "firewalld" ];then
+        check_blacklist_file_status
+    else
+        check_nginx_deny_file
+    fi
+}
+
+
+# firewalld 添加数据：数据来源于 blacklist
+firewallrules_addip_from_blacklist(){
+    black_list_res=$(get_section_value_from_config_path blacklist_path)
+    code=$?
+    print_return_code_message_of_get_section_path $code
+
+    ip_in_firewalld=$(firewall_op_with_get)
+
+    cat $black_list_res $ip_in_firewalld |sort|uniq -d > /tmp/blacklist_firewall_common.txt
+    cat $black_list_res /tmp/blacklist_firewall_common.txt |sort|uniq -u > /tmp/blacklist_exclude_firewall_common.txt  # 获取 blacklist 新增的内容
+    
+    blacklist_new=`cat /tmp/blacklist_exclude_firewall_common.txt|wc -l`
+
+    echo -e "${Info}: blacklist 中新增了 $blacklist_new 条数据，正在进行同步..." && echo
+    
+    while read line || [ -n "$line" ]
+    do
+        sudo /usr/bin/firewall-cmd --permanent --add-rich-rule="rule family=ipv4 source address=$line drop" > /dev/null 2>&1
+        echo -e "${Succeed}: IP: $line 已添加进防火墙列表中."
+        echo "$(date +'%F-%T') 已封禁入侵ip(bfvalid+): $line" >> $log_path
+    done < "/tmp/blacklist_exclude_firewall_common.txt"
+
+    firewalld_reload
+}
+
+
+# 防火墙删除数据: 数据来源于黑名单手动删除操作
+# 如果误删了可通过查找操作日志文件：已解封ip(valid-) 来恢复这些 ip
+removeip_from_firewallrules_with_blacklistremove(){
+    black_list_res=$(get_section_value_from_config_path blacklist_path)
+    code=$?
+    print_return_code_message_of_get_section_path $code
+
+    ip_in_firewalld=$(firewall_op_with_get)
+
+    cat $black_list_res $ip_in_firewalld |sort|uniq -d > /tmp/blacklist_firewall_common.txt
+    cat $ip_in_firewalld /tmp/blacklist_firewall_common.txt |sort|uniq -u > /tmp/firewall_exclude_blacklist_common.txt  # 获取 firewalld 中多的数据
+    
+    firewalld_new=`cat /tmp/firewall_exclude_blacklist_common.txt|wc -l`
+
+    echo -e "${Info}: blacklist 中减少了 $firewalld_new 条数据，正在进行同步..." && echo
+
+    while read line || [ -n "$line" ]
+    do
+        sudo /usr/bin/firewall-cmd --permanent --remove-rich-rule="rule family=ipv4 source address=$line drop" > /dev/null 2>&1
+        echo -e "${Succeed}: IP: $line 已从防火墙列表中删除."
+        echo "$(date +'%F-%T') 已解封ip(bfvalid-): $line" >> $log_path
+    done < "/tmp/firewall_exclude_blacklist_common.txt"
+
+    firewalld_reload
+}
+
+
+# 当 blacklist 和 firewalld 数量相同时进行数据比对
+check_blacklist_and_firewallrules(){
+    black_list_res=$(get_section_value_from_config_path blacklist_path)
+    code=$?
+    print_return_code_message_of_get_section_path $code
+
+    ip_in_firewalld=$(firewall_op_with_get)
+
+    cat $black_list_res $ip_in_firewalld |sort|uniq -d > /tmp/blacklist_firewall_common.txt
+    cat $ip_in_firewalld /tmp/blacklist_firewall_common.txt |sort|uniq -u > /tmp/firewall_exclude_blacklist_common.txt  # 获取 firewalld 中多的数据
+    cat $black_list_res /tmp/blacklist_firewall_common.txt |sort|uniq -u > /tmp/blacklist_exclude_firewall_common.txt  # 获取 blacklist 新增的内容
+    
+    firewalld_new=`cat /tmp/firewall_exclude_blacklist_common.txt|wc -l`
+    blacklist_new=`cat /tmp/blacklist_exclude_firewall_common.txt|wc -l`
+
+    if [[ "$firewalld_new" = 0 || "$blacklist_new" = 0 ]];then
+        return 208
+    fi
+
+    # 极端情况: blacklist 中新增了 a 数据，firewalld 新增了 b 数据,但它们总数一致，那么就要将 a b 做交集
+    if [[ "$firewalld_new" != 0 && "$blacklist_new" != 0 ]];then
+        # 将 blacklist 中新增的数据写入防火墙
+        while read line || [ -n "$line" ]
+        do
+            sudo /usr/bin/firewall-cmd --permanent --add-rich-rule="rule family=ipv4 source address=$line drop" > /dev/null 2>&1
+            echo -e "${Succeed}: IP: $line 已添加进防火墙列表中."
+            echo "$(date +'%F-%T') 已封禁入侵ip(bfvalid+): $line" >> $log_path
+        done < "/tmp/blacklist_exclude_firewall_common.txt"
+
+        # 将 防火墙 里的数据写入 blacklist
+        while read line || [ -n "$line" ]
+        do
+            echo $line >> $black_list_res
+            echo -e "${Succeed}: IP: $line 已添加进黑名单列表中."
+            echo "$(date +'%F-%T') 已封禁入侵ip(bfvalid+): $line" >> $log_path
+        done < "/tmp/firewall_exclude_blacklist_common.txt"
+
+        firewalld_reload
+    fi
+}
+
+
+
+# 数据校对：检查黑名单数据和防火墙数据是否一致
+# 此函数的前提是: 停掉之前的脚本并保证 blacklist 数据最新或者使用 config -m 同步一下数据
+data_proofreading(){
+    black_list_res=$(get_section_value_from_config_path blacklist_path)
+    code=$?
+    print_return_code_message_of_get_section_path $code
+
+    if [ ! -f $black_list_res ];then
+        err_code 104 "没有找到黑名单文件: $black_list_res"
+        exit 1
+    fi
+
+    ip_in_firewalld=$(firewall_op_with_get)
+
+    # 即手动往 blacklist 中添加了数据（应将新增的数据添加进防火墙）
+    if [ `cat $black_list_res|wc -l` -gt `cat $ip_in_firewalld|wc -l` ];then
+        firewallrules_addip_from_blacklist
+        rm -rf /tmp/firewall_rules_ip*
+        rm -rf /tmp/blacklist_firewall_common.txt  /tmp/blacklist_exclude_firewall_common.txt
+        return 0
+    fi
+
+    # 即手动从 blacklist 中删除了数据（应将少掉的数据从防火墙中删除）
+    if [ `cat $black_list_res|wc -l` -lt `cat $ip_in_firewalld|wc -l`  ];then
+        removeip_from_firewallrules_with_blacklistremove
+        rm -rf /tmp/firewall_rules_ip*
+        rm -rf /tmp/blacklist_firewall_common.txt /tmp/firewall_exclude_blacklist_common.txt
+        return 0
+    fi
+
+    # 进行比对(验证是否重复)
+    if [ `cat $black_list_res|wc -l` -eq `cat $ip_in_firewalld|wc -l` ];then
+        check_blacklist_and_firewallrules
+        code=$?
+        if [ $code = 208 ];then
+            err_code $code "数据未发生修改，无需更新..."
+        fi
+
+        rm -rf /tmp/firewall_rules_ip*
+        rm -rf /tmp/blacklist_firewall_common.txt /tmp/firewall_exclude_blacklist_common.txt /tmp/blacklist_exclude_firewall_common.txt
+    fi
+
+}
+
+
+# 将操作记录到日志中
+record_logs_of_block_ip(){
+    to_log=$1
+    log_path=$2
+
+    echo "$(date +'%F-%T') 已封禁入侵ip: $to_log " >> $log_path
+}
+
+
+# 获取记录偏移量的文件路径
+get_seek_path(){
+    seek_file_path=$1
+
+    case "$seek_file_path" in
+    nginxlog)
+        seek_file_path=/tmp/nginxlog_seek
+        ;;
+    securelog)
+        seek_file_path=/tmp/securelog_seek
+        ;;
+    *)
+        return 204
+        ;;
+    esac
+
+    echo $seek_file_path
+}
+
+# 生成文件名包含上次偏移量的新文件，用于记录自偏移量后的新增内容
+get_the_contents_added_since_the_last_read(){
+    seek_file_path=$1
+    log_path=$2
+
+    name=`echo $seek_file_path|awk -F '/' '{print $3}'|awk -F '_' '{print $1}'`
+
+    last_read_bytes_of_log=`cat $seek_file_path`
+    the_contents_added_since_the_last_read=/tmp/${name}_since_$last_read_bytes_of_log
+
+    # 跳过上次读取过的内容,将新增的内容复制到临时文件
+    sudo dd if=$log_path of=$the_contents_added_since_the_last_read bs=1 skip=$last_read_bytes_of_log > /dev/null 2>&1
+    if [ $? != 0 ];then
+        return 101
+    fi
+
+    echo $the_contents_added_since_the_last_read
+}
+
+
+# 计算下一次的偏移量
+get_next_seek(){
+    contents_added_path=$1
+    last_read_bytes_path=$2
+
+    last_read_bytes=`cat $last_read_bytes_path`
+
+    # 获取新增加内容的字节数
+    the_contents_added_byte=`sudo wc -c $contents_added_path |awk '{print $1}'`
+
+    # 获取总共需要  skip 的字节数
+    next_seek=`expr $last_read_bytes + $the_contents_added_byte`
+
+    # 记录到偏移量文件中，供下次读取
+    echo $next_seek > $last_read_bytes_path
+}
+
+
+# 获取 ip:、数据来源于 nginx logs 目录下的所有 log 文件
+# 因为做了 nginx 日志切割，需通过 crontab 在每天 00:01 重置偏移量: 0 0 * * * /usr/bin/echo 0 > /tmp/nginxlog_seek && rm -rf /tmp/nginxlog_since* && rm -rf /tmp/securelog_since*
+get_ip_from_nginxlog(){
+    nginx_log_path=$(get_section_value_from_config_path nginxlog_path)
+    code=$?
+    print_return_code_message_of_get_section_path $code
+
+    if [ ! -f $nginx_log_path ];then
+        err_code 104 "nginx 日志文件不存在,请修改配置文件里的 nginxlog_path 的值..."
+        exit 1
+    fi
+
+    limit_count_section_value=$(get_section_value_from_config_path limit_count)
+    code=$?
+    print_return_code_message_of_get_section_path $code
+
+    # 获取记录偏移量的文件路径
+    nginx_seek_file_path_res=$(get_seek_path nginxlog)
+    if [ $? -eq 204 ];then
+        err_code 104 "传入的参数错误..."
+        exit 1
+    fi
+
+    if [ ! -f $nginx_seek_file_path_res ];then  
+        err_code 104 "$nginx_seek_file_path_res 不存在..."
+        exit 1
+    fi
+
+    # 生成一个文件用于记录自偏移量后新增的内容
+    nginx_the_contents_added_res=$(get_the_contents_added_since_the_last_read  $nginx_seek_file_path_res $nginx_log_path)
+    if [ $? -eq 101 ];then
+        err_code 101 "转存 $nginx_the_contents_added_res 时出现读写错误..."
+    fi
+
+    # 获取自偏移量后新增的 ip
+    ip_from_nginx_log=`cat $nginx_the_contents_added_res |grep -v "/favicon@53x59.png" | awk -F ' ' '{if ($9 == 404 || $9 == 403 || $9 == 400 || $8 == 400 || $7 == 400 || $9 == 444 || $9 == 405 || $9 == 503) print $1}' | sort -rn  |uniq -c | awk -F ' ' '{if ($1 > $limit_count_section_value) print $2}'`
+
+    for nginxlogip in $ip_from_nginx_log
+    do
+        ip_arr[${#ip_arr[*]}]=${nginxlogip}
+    done  
+
+    # 生成下一次的偏移量
+    get_next_seek $nginx_the_contents_added_res $nginx_seek_file_path_res
+}
+
+
+# 获取 ip: 数据来源于 secure log
+get_ip_from_securelog(){
+    secure_section_value=$(get_section_value_from_config_path securelog_path)
+    code=$?
+    print_return_code_message_of_get_section_path $code
+
+    if [ ! -f $secure_section_value ];then
+        err_code 104 "secure 日志文件不存在,请修改配置文件里的 securelog_path 的值..."
+        exit 1
+    fi
+
+    # 获取记录偏移量的文件路径
+    secure_seek_file_path_res=$(get_seek_path securelog)
+    if [ $? -eq 204 ];then
+        err_code 104 "传入的参数错误..."
+        exit 1
+    fi
+
+    if [ ! -f $secure_seek_file_path_res ];then  
+        err_code 104 "$secure_seek_file_path_res 不存在..."
+        exit 1
+    fi
+
+    # 生成一个文件用于记录自偏移量后新增的内容
+    secure_the_contents_added_res=$(get_the_contents_added_since_the_last_read  $secure_seek_file_path_res $secure_section_value)
+    if [ $? -eq 101 ];then
+        err_code 101 "转存 $secure_the_contents_added_res 时出现读写错误..."
+    fi
+
+    # 获取自偏移量后新增的 ip
+    ip_from_secure_log=`sudo cat $secure_the_contents_added_res |grep -E 'Did not|Bad protocol' | grep -E -o "(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)"  |sort -u`
+
+    for securelogip in $ip_from_secure_log
+    do
+	    ip_arr[${#ip_arr[*]}]=${securelogip}
+    done
+    #echo "从 secure log 中获得 ${#ip_arr[*]} 个 ip,分别为：${ip_arr[*]}"
+
+    # 生成下一次的偏移量
+    get_next_seek $secure_the_contents_added_res $secure_seek_file_path_res
+}
+
+
+# 获取 ip: 数据来源于 lastb 命令
+get_ip_from_lastb(){
+    limit_count_section_value=$(get_section_value_from_config_path limit_count)
+    code=$?
+    print_return_code_message_of_get_section_path $code
+
+    ip_from_lastb=`sudo lastb |awk -F ' ' '{print $3}'|grep -E -o "(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)"|sort -rn |uniq -c| awk -F ' ' '{if ($1 > $limit_count_section_value) print $2}'`
+
+    # 初始化: 将从 lastb 命令中获取到的 ip 添加进文件,防止重复添加
+    added_to_file=/tmp/lastb_added
+    if [ ! -f $added_to_file ];then
+        echo "139.19.117.197" >> /tmp/lastb_added
+    fi
+
+    for login_fail_ip in $ip_from_lastb
+    do
+        # 校验数据：如果 ip 在 /tmp/lastb_added 中找到表示已添加过，否则添加进数组
+        isin_file_res=`cat /tmp/lastb_added |grep -Fx "$login_fail_ip"|wc -l`
+        if [ $isin_file_res != 0 ];then
+            continue
+        fi
+
+	    ip_arr[${#ip_arr[*]}]=${login_fail_ip}
+        echo "$login_fail_ip" >> /tmp/lastb_added
+    done
+}
+
+
+# 从日志文件中获取 ip 的管理函数
+get_ip_manager(){
+    get_ip_from_nginxlog
+    get_ip_from_securelog
+    get_ip_from_lastb
+
+    # echo "从 secure log 中获得 ${#ip_arr[*]} 个 ip,分别为：${ip_arr[*]}"
+}
+
+
+# block ip handler 函数
+get_block_ip_type_of_block_ip_handler(){
+    block_ip_type=$1
+
+    case "$block_ip_type" in
+    firewalld)
+        block_ip_type=firewall_op_with_add
+        ;;
+    nginx)
+        block_ip_type=nginx_record_add
+        ;;
+    esac
+
+    echo $block_ip_type
+}
+
+
+# 添加 ip 到黑名单: 数据来源于 nginx logs、secure logs、lastb
+add_ip_to_blacklist_with_logs(){
+    get_ip_manager
+    
+    if [ ${#ip_arr[*]} -eq 0 ];then
+        echo -e "${Info}: 无事发生，在这风平浪静的时候坐下来喝杯茶吧..." && echo
+        return 208
+    fi
+
+    # 清空返回值
+    cat /dev/null > /tmp/add_ip_to_blacklist_return_code
+
+    log_path=$(get_section_value_from_config_path server_secure_log_path)
+    code=$?
+    print_return_code_message_of_get_section_path $code
+    if [ ! -f $log_path ];then
+        err_code 104 "操作日志记录文件: $log_path 不存在..."
+        exit 1
+    fi
+
+    for ip in ${ip_arr[*]}
+    do
+        # 该 ip 在白名单文件中存在就不执行后面的操作
+        # 白名单的优先级比黑名单要高，所以在白名单中的 ip 永远不会被添加进黑名单
+        isin=$(isipexist_in_file $whitelist_path $ip)
+        code=$?
+        if [ $code -eq 200 ];then
+            err_code $code "$ip 在白名单中已存在，将不会添加进黑名单..."
+            echo $code >> /tmp/add_ip_to_blacklist_return_code
+            continue
+        fi
+
+        block_ip_type=$(get_section_value_from_config_path block_ip_type)
+        code=$?
+        print_return_code_message_of_get_section_path $code
+
+        # 封禁方案为 firewalld 时才生效,如果是 nginx 就不写进 blacklist 中
+        if [ "$block_ip_type" = "firewalld" ];then
+            # 该 ip 在黑名单文件中存在就不执行后面的操作
+            isin=$(isipexist_in_file $blacklist_path $ip)
+            code=$?
+            if [ $code -eq 200 ];then
+                err_code $code "$ip 在黑名单文件中已存在，请勿重复添加..."
+                echo $code >> /tmp/add_ip_to_blacklist_return_code
+                continue
+            fi
+
+            # 添加进黑名单
+            echo $ip >> $blacklist_path
+            echo -e "${Succeed}: IP: $ip 已添加进黑名单文件中."
+
+            md5sum $blacklist_path |awk '{print $1}' > /tmp/.blacklist_md5
+        fi
+
+        # 添加进防火墙/nginx host deny 文件中
+        $block_ip_type_result $ip
+        code=$?
+        # 记录返回值用于判断是否重启防火墙
+        echo $code >> /tmp/add_ip_to_blacklist_return_code
+        if [ $code = 0 ];then
+            # record_logs_of_block_ip $ip $log_path
+            echo "$(date +'%F-%T') 已封禁入侵ip(logs): $ip " >> $log_path
+        else
+            continue
+        fi 
+
+    done
+
+    reload_of_block_ip_type
+}
+
+
+# 添加 ip 到黑名单: 数据来源于命令行输入
+add_ip_to_blacklist_with_input(){
+    ip_from_input=$1
+
+    # 判断输入的是否符合 ip 格式
+    is_ip_result=$(isip_from_input $ip_from_input)
+    code=$?
+    if [ $code != 0 ];then
+        err_code $code "$ip_from_input 不符合 ip 格式，请重新输入..."
+        return 105
+    else
+        ip_from_input=$is_ip_result
+    fi
+
+    isipexist_in_file $whitelist_path $ip_from_input
+    code=$?
+    if [ $code -eq 200 ];then
+        err_code $code "$ip_from_input 在白名单中已存在，将不会添加进黑名单..."
+        return 200
+    fi
+
+    # 该 ip 在黑名单文件中存在就不执行后面的操作
+    if [ "$block_ip_type" = "firewalld" ];then
+        isipexist_in_file $blacklist_path $ip_from_input
+        code=$?
+        if [ $code -eq 200 ];then
+            err_code $code "$ip_from_input 在黑名单中已存在，请勿重复添加..."
+            return 200
+        fi
+
+        # 添加进黑名单
+        echo $ip_from_input >> $blacklist_path
+        echo -e "${Succeed}: IP: $ip_from_input 已添加进黑名单文件中."
+    fi
+    
+    # 添加进防火墙/nginx host deny 文件中
+    $block_ip_type_result $ip_from_input
+    code=$?
+    echo $code >> /tmp/add_ip_to_blacklist_return_code
+    if [ $code != 0 ];then
+        return $code
+    fi
+
+    if [ $code = 0 ];then
+        record_logs_of_block_ip $ip_from_input $log_path
+    fi
+
+    md5sum $blacklist_path |awk '{print $1}' > /tmp/.blacklist_md5
+}
+
+
+# 添加 ip 到黑名单: 数据来源于指定文件
+add_ip_to_blacklist_with_file(){
+    block_ip_file_path=$1
+
+    # 判断输入是否符合文件路径格式
+    real_path=$(get_real_path $block_ip_file_path)
+    is_file_res=$(vaild_is_path_from_input $real_path)
+    code=$?
+    if [ $code != 0 ];then
+        print_message_of_vaild_is_path_from_input $code $real_path
+    else
+        block_ip_file_path=$is_file_res
+    fi
+
+    for ip_from_file in `cat $block_ip_file_path`
+    do
+        is_ip_result=$(isip_from_input $ip_from_file)
+        code=$?
+        if [ $code != 0 ];then
+            err_code $code "$ip_from_file 不符合 ip 格式，请重新输入..."
+            continue
+        fi
+
+        isipexist_in_file $whitelist_path $ip_from_file
+        code=$?
+        if [ $code -eq 200 ];then
+            err_code $code "$ip_from_file 在白名单中已存在，将不会添加进黑名单..."
+            echo $code >> /tmp/add_ip_to_blacklist_return_code
+            continue
+        fi
+
+        if [ "$block_ip_type" = "firewalld" ];then
+            isipexist_in_file $blacklist_path $ip_from_file
+            code=$?
+            if [ $code -eq 200 ];then
+                err_code $code "$ip_from_file 在黑名单中已存在，请勿重复添加..."
+                echo $code >> /tmp/add_ip_to_blacklist_return_code
+                continue
+            fi
+
+            echo $ip_from_file >> $blacklist_path
+            echo -e "${Succeed}: IP: $ip_from_file 已添加进黑名单文件中."
+        fi
+
+        $block_ip_type_result $ip_from_file
+        code=$?
+        echo $code >> /tmp/add_ip_to_blacklist_return_code
+        if [ $code = 0 ];then
+            record_logs_of_block_ip $ip_from_file $log_path
+        fi
+   
+    done
+
+    md5sum $blacklist_path |awk '{print $1}' > /tmp/.blacklist_md5
+}
+
+
+# unban ip handler 函数
+get_block_ip_type_of_unban_ip_handler(){
+    block_ip_type=$(get_section_value_from_config_path block_ip_type)
+    code=$?
+    print_return_code_message_of_get_section_path $code
+
+    case "$block_ip_type" in
+    firewalld)
+        block_ip_type=firewall_op_with_remove
+        ;;
+    nginx)
+        block_ip_type=nginx_record_remove
+        ;;
+    esac
+
+    echo $block_ip_type
+}
+
+
+# 删除黑名单数据: 数据来源于 unban_the_ip 传入
+delete_ip_from_blacklist(){
+    to_remove=$1
+
+    blacklist_path=$(get_section_value_from_config_path blacklist_path)
+    code=$?
+    print_return_code_message_of_get_section_path $code
+
+    isipexist_in_file $blacklist_path $to_remove
+    code=$?
+    if [ $code -eq 144 ];then
+        return 144
+    fi
+
+    sed -i '/^'"${to_remove}"'$/d' $blacklist_path
+    echo -e "${Succeed}: IP: $to_remove 已从黑名单列表中删除."
+
+    md5sum $blacklist_path |awk '{print $1}' > /tmp/.blacklist_md5  
+}
+
+
+# 删除黑名单数据: 数据来源于命令行输入
+delete_ip_from_blacklist_with_input(){
+    to_remove=$1
+    
+    is_ip_result=$(isip_from_input $to_remove)
+    code=$?
+    if [ $code != 0 ];then
+        err_code $code "$to_remove 不符合 ip 格式，请重新输入..."
+        return 105
+    fi
+
+    if [ "$block_ip_type" = "firewalld" ];then
+        isipexist_in_file $blacklist_path $to_remove
+        code=$?
+        if [ $code -eq 144 ];then
+            err_code $code "IP: $to_remove 在黑名单文件中不存在..."
+            return 144
+        fi
+
+        sed -i '/^'"${to_remove}"'$/d' $blacklist_path
+        echo -e "${Succeed}: IP: $to_remove 已从黑名单列表中删除."
+
+        md5sum $blacklist_path |awk '{print $1}' > /tmp/.blacklist_md5
+    fi
+
+    $unban_the_ip_type_result $to_remove
+    code=$?
+    echo $code >> /tmp/add_ip_to_blacklist_return_code
+    if [ $code != 0 ];then
+        return $code
+    fi
+
+    if [ $code = 0 ];then
+        echo "$(date +'%F-%T') 解禁ip: $to_remove" >> $log_path
+    fi  
+}
+
+
+# 批量删除黑名单中的 ip: 数据来源于指定的文件
+batch_delete_ip_from_blacklist(){
+    unban_the_ip_file_path=$1
+
+    # 判断输入是否符合文件路径格式
+    real_path=$(get_real_path $unban_the_ip_file_path)
+    
+    is_file_res=$(vaild_is_path_from_input $real_path)
+    code=$?
+    if [ $code != 0 ];then
+        print_message_of_vaild_is_path_from_input $code $real_path
+    else
+        unban_the_ip_file_path=$is_file_res
+    fi
+
+    for ip_from_file in `cat $unban_the_ip_file_path`
+    do
+        is_ip_result=$(isip_from_input $ip_from_file)
+        code=$?
+        if [ $code != 0 ];then
+            err_code $code "$ip_from_file 不符合 ip 格式，请重新输入..."
+            echo $code >> /tmp/add_ip_to_blacklist_return_code
+            continue
+        fi
+
+        if [ "$block_ip_type" = "firewalld" ];then
+            isipexist_in_file $blacklist_path $ip_from_file
+            code=$?
+            if [ $code -eq 144 ];then
+                err_code $code "$ip_from_file 在黑名单中不存在..."
+                echo $code >> /tmp/add_ip_to_blacklist_return_code
+                continue
+            fi
+
+            sed -i '/^'"${ip_from_file}"'$/d' $blacklist_path
+            echo -e "${Succeed}: IP: $ip_from_file 已从黑名单列表中删除."
+
+            md5sum $blacklist_path |awk '{print $1}' > /tmp/.blacklist_md5
+        fi
+
+        $unban_the_ip_type_result $ip_from_file
+        code=$?
+        echo $code >> /tmp/add_ip_to_blacklist_return_code
+        if [ $code = 0 ];then
+            echo "$(date +'%F-%T') 解禁ip: $ip_from_file" >> $log_path
+        fi
+    done
+}
+
+
+# 打印黑名单数据
+print_blacklist(){
+    blacklist_path=$(get_section_value_from_config_path blacklist_path)
+    code=$?
+    print_return_code_message_of_get_section_path $code
+
+    while read line
+    do
+        echo $line
+    done < $blacklist_path
+}
